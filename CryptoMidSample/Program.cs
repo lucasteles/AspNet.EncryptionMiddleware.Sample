@@ -5,8 +5,8 @@ var builder = WebApplication.CreateBuilder(args);
 
 var app = builder.Build();
 
-app.UseMiddleware<CryptoMiddleware.Response>();
 app.UseMiddleware<CryptoMiddleware.Request>();
+app.UseMiddleware<CryptoMiddleware.Response>();
 app.UseRouting();
 
 Greet SayHello(string name) => new($"{name}!");
