@@ -1,3 +1,6 @@
+using System.Net.Http.Json;
+using System.Text.Json;
+
 namespace CryptoMidSample.Tests;
 
 public class ApiTests : IDisposable
@@ -19,6 +22,9 @@ public class ApiTests : IDisposable
     {
         var name = faker.Name.FirstName();
         var response = await client.GetStringAsync($"/hello/{name}");
-        response.Should().Be($"Hello {name}!");
+        response.Should().Be(
+            $$"""
+            {"hello":"{{name.ToUpper()}}"}
+            """);
     }
 }
