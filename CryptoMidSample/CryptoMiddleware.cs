@@ -1,4 +1,5 @@
-﻿using System.Net.Http.Headers;
+﻿using System.IO.Pipelines;
+using System.Net.Http.Headers;
 using System.Net.Mime;
 using System.Security.Cryptography;
 using Microsoft.Extensions.Options;
@@ -37,35 +38,62 @@ public static class CryptoMiddleware
                 return;
             }
 
+            var cancellationToken = context.RequestAborted;
+            context.Request.EnableBuffering();
             context.Request.ContentType = MediaTypeNames.Application.Json;
 
+            Pipe pipe = new();
+            var bodyReader = context.Request.BodyReader;
             var originalBody = context.Request.Body;
-            context.Request.Body = await TransformBody(originalBody, context.RequestAborted);
+            context.Request.Body = pipe.Reader.AsStream();
 
-            await next(context);
-            context.Response.Body = originalBody;
+            try
+            {
+                await Task.WhenAll(
+                    ParseBody(bodyReader, pipe.Writer, cancellationToken),
+                    next(context)
+                );
+            }
+            finally
+            {
+                context.Request.Body = originalBody;
+                await pipe.Reader.CompleteAsync();
+                await pipe.Writer.CompleteAsync();
+            }
         }
 
-        async Task<Stream> TransformBody(
-            Stream body,
-            CancellationToken cancellationToken
-        )
+        async Task ParseBody(PipeReader bodyReader, PipeWriter writer,
+            CancellationToken cancellationToken)
         {
             using var aes = Aes.Create();
             aes.Key = options.Value.PrivateKey;
             aes.IV = options.Value.IV;
 
             using FromBase64Transform base64Transform = new();
-            using var transform = aes.CreateDecryptor();
+            using var decryptor = aes.CreateDecryptor();
 
-            CryptoStream base64Stream = new(body, base64Transform, CryptoStreamMode.Read);
-            CryptoStream aesStream = new(base64Stream, transform, CryptoStreamMode.Read);
+            await using CryptoStream base64Stream =
+                new(bodyReader.AsStream(), base64Transform, CryptoStreamMode.Read);
+            await using CryptoStream aesStream =
+                new(base64Stream, decryptor, CryptoStreamMode.Read);
 
-            MemoryStream result = new();
-            await aesStream.CopyToAsync(result, cancellationToken);
+            var reader = PipeReader.Create(aesStream);
 
-            result.Seek(0, SeekOrigin.Begin);
-            return result;
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                var readResult = await reader.ReadAsync(cancellationToken);
+                var buffer = readResult.Buffer;
+
+                foreach (var memory in buffer)
+                    await writer.WriteAsync(memory, cancellationToken);
+
+                reader.AdvanceTo(buffer.End);
+                await writer.FlushAsync(cancellationToken);
+                if (readResult.IsCompleted) break;
+            }
+
+            await reader.CompleteAsync();
+            await writer.CompleteAsync();
         }
     }
 
@@ -82,44 +110,81 @@ public static class CryptoMiddleware
 
         public async Task InvokeAsync(HttpContext context)
         {
+            Pipe pipe = new();
             var cancellationToken = context.RequestAborted;
+            var bodyWriter = context.Response.BodyWriter;
             var originalBody = context.Response.Body;
+            context.Response.Body = pipe.Writer.AsStream();
 
-            await using MemoryStream bufferBody = new();
-
-            context.Response.Body = bufferBody;
-            await next(context);
-            context.Response.Body = originalBody;
-
-            bufferBody.Seek(0, SeekOrigin.Begin);
-            if (context.Response.ContentType is not ContentType)
+            try
             {
-                await bufferBody.CopyToAsync(originalBody, cancellationToken);
-                return;
-            }
+                await next(context);
+                await pipe.Writer.CompleteAsync();
 
-            await using var newBody = await TransformBody(bufferBody, cancellationToken);
-            await newBody.CopyToAsync(originalBody, cancellationToken);
+                if (context.Response.ContentType is not ContentType)
+                    await PassBody(pipe.Reader, bodyWriter, cancellationToken);
+                else
+                    await ParseBody(pipe.Reader, bodyWriter, cancellationToken);
+            }
+            finally
+            {
+                context.Response.Body = originalBody;
+                await pipe.Reader.CompleteAsync();
+                await pipe.Writer.CompleteAsync();
+            }
         }
 
-        async Task<Stream> TransformBody(Stream body, CancellationToken cancellationToken)
+        static async Task PassBody(
+            PipeReader reader,
+            PipeWriter writer,
+            CancellationToken cancellationToken)
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                var readResult = await reader.ReadAsync(cancellationToken);
+                var buffer = readResult.Buffer;
+
+                foreach (var memory in buffer)
+                    await writer.WriteAsync(memory, cancellationToken);
+
+                reader.AdvanceTo(buffer.End);
+                if (readResult.IsCompleted) break;
+            }
+
+            await writer.CompleteAsync();
+        }
+
+        async Task ParseBody(
+            PipeReader reader,
+            PipeWriter writer,
+            CancellationToken cancellationToken)
         {
             using var aes = Aes.Create();
             aes.Key = options.Value.PrivateKey;
             aes.IV = options.Value.IV;
 
+            using var encryptor = aes.CreateEncryptor();
             using ToBase64Transform base64Transform = new();
-            using var transform = aes.CreateEncryptor();
 
-            MemoryStream result = new();
-            CryptoStream base64Stream = new(result, base64Transform, CryptoStreamMode.Write);
-            CryptoStream aesStream = new(base64Stream, transform, CryptoStreamMode.Write);
+            await using CryptoStream base64Stream = new(
+                writer.AsStream(), base64Transform, CryptoStreamMode.Write);
+            await using CryptoStream cryptoStream = new(
+                base64Stream, encryptor, CryptoStreamMode.Write);
 
-            await body.CopyToAsync(aesStream, cancellationToken);
-            await aesStream.FlushFinalBlockAsync(cancellationToken);
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                var readResult = await reader.ReadAsync(cancellationToken);
+                var buffer = readResult.Buffer;
 
-            result.Seek(0, SeekOrigin.Begin);
-            return result;
+                foreach (var memory in buffer)
+                    await cryptoStream.WriteAsync(memory, cancellationToken);
+
+                reader.AdvanceTo(buffer.End);
+                await cryptoStream.FlushFinalBlockAsync(cancellationToken);
+                if (readResult.IsCompleted) break;
+            }
+
+            await writer.CompleteAsync();
         }
     }
 }
