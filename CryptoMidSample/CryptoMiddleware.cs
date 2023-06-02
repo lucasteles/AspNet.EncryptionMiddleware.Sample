@@ -1,5 +1,6 @@
 ﻿using System.Net.Http.Headers;
 using System.Net.Mime;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace CryptoMidSample;
@@ -12,9 +13,14 @@ public static class CryptoMiddleware
     public class Request
     {
         readonly RequestDelegate next;
+        readonly byte[] key;
 
-        public Request(RequestDelegate next) =>
+        public Request(RequestDelegate next, IConfiguration configuration)
+        {
             this.next = next;
+            key = Encoding.UTF8.GetBytes(configuration.GetValue<string>("PrivateKey")
+                                         ?? throw new ArgumentNullException());
+        }
 
         public async Task InvokeAsync(HttpContext context)
         {
@@ -28,20 +34,42 @@ public static class CryptoMiddleware
             context.Request.ContentType = MediaTypeNames.Application.Json;
 
             context.Request.Body = await TransformBody(
-                context.Request.Body, Mode.Decode, context.RequestAborted);
+                context.Request.Body, context.RequestAborted);
 
-            await next(context);
+            await next(context)
 
             context.Response.Body = originalBody;
+        }
+
+        static async Task<Stream> TransformBody(
+            Stream body,
+            CancellationToken cancellationToken
+        )
+        {
+            using ToBase64Transform base64Transform = new();
+            MemoryStream result = new();
+            CryptoStream base64Stream = new(result, base64Transform, mode);
+
+            await body.CopyToAsync(base64Stream, cancellationToken);
+
+            await base64Stream.FlushFinalBlockAsync(cancellationToken);
+
+            result.Seek(0, SeekOrigin.Begin);
+            return result;
         }
     }
 
     public class Response
     {
         readonly RequestDelegate next;
+        readonly byte[] key;
 
-        public Response(RequestDelegate next) =>
+        public Response(RequestDelegate next, IConfiguration configuration)
+        {
             this.next = next;
+            key = Encoding.UTF8.GetBytes(configuration.GetValue<string>("PrivateKey")
+                                         ?? throw new ArgumentNullException());
+        }
 
         public async Task InvokeAsync(HttpContext context)
         {
@@ -62,38 +90,37 @@ public static class CryptoMiddleware
             }
 
             await using var newBody =
-                await TransformBody(bufferBody, Mode.Encode, cancellationToken);
+                await TransformBody2(bufferBody, key, CryptoStreamMode.Write, cancellationToken);
 
             await newBody.CopyToAsync(originalBody, cancellationToken);
         }
     }
 
-    enum Mode
-    {
-        Encode,
-        Decode,
-    }
-
-    static async Task<Stream> TransformBody(
-        Stream body, Mode mode,
+    static async Task<Stream> TransformBody2(
+        Stream body, byte[] key, CryptoStreamMode mode,
         CancellationToken cancellationToken
     )
     {
+        // using var aes = Aes.Create();
+        // aes.Key = key;
+        //
+        // using var transform = mode switch
+        // {
+        //     CryptoStreamMode.Write => aes.CreateEncryptor(),
+        //     CryptoStreamMode.Read => aes.CreateDecryptor(),
+        //     _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, null),
+        // };
+
+        using ToBase64Transform base64Transform = new();
+
         MemoryStream result = new();
-        StreamWriter writer = new(result);
-        StreamReader reader = new(body);
+        // CryptoStream aesStream = new(result, transform, mode);
+        CryptoStream base64Stream = new(result, base64Transform, mode);
 
-        var stringBody = await reader.ReadToEndAsync(cancellationToken);
+        await body.CopyToAsync(base64Stream, cancellationToken);
 
-        var decodedBody = mode switch
-        {
-            Mode.Encode => Convert.ToBase64String(Encoding.UTF8.GetBytes(stringBody)),
-            Mode.Decode => Encoding.UTF8.GetString(Convert.FromBase64String(stringBody)),
-            _ => stringBody,
-        };
+        await base64Stream.FlushFinalBlockAsync(cancellationToken);
 
-        await writer.WriteAsync(decodedBody);
-        await writer.FlushAsync();
         result.Seek(0, SeekOrigin.Begin);
         return result;
     }
