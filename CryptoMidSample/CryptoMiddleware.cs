@@ -1,7 +1,7 @@
 ﻿using System.Net.Http.Headers;
 using System.Net.Mime;
 using System.Security.Cryptography;
-using System.Text;
+using Microsoft.Extensions.Options;
 
 namespace CryptoMidSample;
 
@@ -10,17 +10,24 @@ public static class CryptoMiddleware
     public const string ContentType = "application/jose";
     public static readonly MediaTypeHeaderValue MediaTypeHeader = new(ContentType);
 
+    public class Options
+    {
+        public required byte[] PrivateKey { get; init; }
+
+        public required byte[] IV { get; init; }
+    }
+
     public class Request
     {
         readonly RequestDelegate next;
-        readonly byte[] key;
+        readonly IOptions<Options> options;
 
-        public Request(RequestDelegate next, IConfiguration configuration)
+        public Request(RequestDelegate next, IOptions<Options> options)
         {
             this.next = next;
-            key = Encoding.UTF8.GetBytes(configuration.GetValue<string>("PrivateKey")
-                                         ?? throw new ArgumentNullException());
+            this.options = options;
         }
+
 
         public async Task InvokeAsync(HttpContext context)
         {
@@ -30,29 +37,32 @@ public static class CryptoMiddleware
                 return;
             }
 
-            var originalBody = context.Response.Body;
             context.Request.ContentType = MediaTypeNames.Application.Json;
 
-            context.Request.Body = await TransformBody(
-                context.Request.Body, context.RequestAborted);
+            var originalBody = context.Request.Body;
+            context.Request.Body = await TransformBody(originalBody, context.RequestAborted);
 
-            await next(context)
-
+            await next(context);
             context.Response.Body = originalBody;
         }
 
-        static async Task<Stream> TransformBody(
+        async Task<Stream> TransformBody(
             Stream body,
             CancellationToken cancellationToken
         )
         {
-            using ToBase64Transform base64Transform = new();
+            using var aes = Aes.Create();
+            aes.Key = options.Value.PrivateKey;
+            aes.IV = options.Value.IV;
+
+            using FromBase64Transform base64Transform = new();
+            using var transform = aes.CreateDecryptor();
+
+            CryptoStream base64Stream = new(body, base64Transform, CryptoStreamMode.Read);
+            CryptoStream aesStream = new(base64Stream, transform, CryptoStreamMode.Read);
+
             MemoryStream result = new();
-            CryptoStream base64Stream = new(result, base64Transform, mode);
-
-            await body.CopyToAsync(base64Stream, cancellationToken);
-
-            await base64Stream.FlushFinalBlockAsync(cancellationToken);
+            await aesStream.CopyToAsync(result, cancellationToken);
 
             result.Seek(0, SeekOrigin.Begin);
             return result;
@@ -62,13 +72,12 @@ public static class CryptoMiddleware
     public class Response
     {
         readonly RequestDelegate next;
-        readonly byte[] key;
+        readonly IOptions<Options> options;
 
-        public Response(RequestDelegate next, IConfiguration configuration)
+        public Response(RequestDelegate next, IOptions<Options> options)
         {
             this.next = next;
-            key = Encoding.UTF8.GetBytes(configuration.GetValue<string>("PrivateKey")
-                                         ?? throw new ArgumentNullException());
+            this.options = options;
         }
 
         public async Task InvokeAsync(HttpContext context)
@@ -89,39 +98,28 @@ public static class CryptoMiddleware
                 return;
             }
 
-            await using var newBody =
-                await TransformBody2(bufferBody, key, CryptoStreamMode.Write, cancellationToken);
-
+            await using var newBody = await TransformBody(bufferBody, cancellationToken);
             await newBody.CopyToAsync(originalBody, cancellationToken);
         }
-    }
 
-    static async Task<Stream> TransformBody2(
-        Stream body, byte[] key, CryptoStreamMode mode,
-        CancellationToken cancellationToken
-    )
-    {
-        // using var aes = Aes.Create();
-        // aes.Key = key;
-        //
-        // using var transform = mode switch
-        // {
-        //     CryptoStreamMode.Write => aes.CreateEncryptor(),
-        //     CryptoStreamMode.Read => aes.CreateDecryptor(),
-        //     _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, null),
-        // };
+        async Task<Stream> TransformBody(Stream body, CancellationToken cancellationToken)
+        {
+            using var aes = Aes.Create();
+            aes.Key = options.Value.PrivateKey;
+            aes.IV = options.Value.IV;
 
-        using ToBase64Transform base64Transform = new();
+            using ToBase64Transform base64Transform = new();
+            using var transform = aes.CreateEncryptor();
 
-        MemoryStream result = new();
-        // CryptoStream aesStream = new(result, transform, mode);
-        CryptoStream base64Stream = new(result, base64Transform, mode);
+            MemoryStream result = new();
+            CryptoStream base64Stream = new(result, base64Transform, CryptoStreamMode.Write);
+            CryptoStream aesStream = new(base64Stream, transform, CryptoStreamMode.Write);
 
-        await body.CopyToAsync(base64Stream, cancellationToken);
+            await body.CopyToAsync(aesStream, cancellationToken);
+            await aesStream.FlushFinalBlockAsync(cancellationToken);
 
-        await base64Stream.FlushFinalBlockAsync(cancellationToken);
-
-        result.Seek(0, SeekOrigin.Begin);
-        return result;
+            result.Seek(0, SeekOrigin.Begin);
+            return result;
+        }
     }
 }

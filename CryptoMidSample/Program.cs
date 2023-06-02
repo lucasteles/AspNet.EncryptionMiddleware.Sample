@@ -3,6 +3,9 @@ using static Microsoft.AspNetCore.Http.TypedResults;
 
 var builder = WebApplication.CreateBuilder(args);
 
+builder.Services.AddOptions<CryptoMiddleware.Options>()
+    .BindConfiguration(string.Empty);
+
 var app = builder.Build();
 
 app.UseMiddleware<CryptoMiddleware.Response>();

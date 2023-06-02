@@ -34,7 +34,7 @@ public class ApiTests : IDisposable
         response.Should()
             .BeSuccessful()
             .And.HaveHeader(HeaderNames.ContentType, "application/jose")
-            .And.MatchInContent("eyJuYW1lIjoiUGV0ZXIhIn0=");
+            .And.MatchInContent("X5JZf36r9HVPSiVSSN0llJGLfJg+QFvCLgKfcdp1GjU=");
     }
 
     [Fact]
@@ -44,7 +44,7 @@ public class ApiTests : IDisposable
             new(HttpMethod.Post, "/hello")
             {
                 Content = new StringContent(
-                    "eyJuYW1lIjoiUGV0ZXIifQ==",
+                    "A14VJmXsfiznGXWPvqTSgd1hTjp92K1nS4nYDUKMvg4=",
                     CryptoMiddleware.MediaTypeHeader
                 ),
             }
